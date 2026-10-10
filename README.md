@@ -2,7 +2,6 @@
 
 Rust toolkit for encoding analysis, decryption with known keys, and network inspection.
 
-[الدليل العربي](README_AR.md) · [Live demo guide (Arabic)](LIVE_DEMO_AR.md)
 
 ## Build and run
 
