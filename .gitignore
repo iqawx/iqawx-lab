@@ -1,0 +1,8 @@
+/target/
+/bin/
+/.DS_Store
+**/.DS_Store
+/.env
+/.env.*
+/reports/
+*.log

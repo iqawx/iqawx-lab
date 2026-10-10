@@ -1,0 +1,6 @@
+# Synthetic demonstration data only; frequencies are invented, not Nmap data.
+ssh-demo     22/tcp    0.70
+http-demo    80/tcp    0.90
+https-demo  443/tcp    0.80
+dns-demo     53/udp    0.95
+ntp-demo    123/udp    0.60
