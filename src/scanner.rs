@@ -1155,9 +1155,11 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let mut opts = options(Protocol::Tcp);
+        // Give Windows time to report refusal instead of testing the 150 ms deadline.
+        opts.timeout_ms = 5000;
         opts.retries = 2;
         let report = scan(&["127.0.0.1".into()], &[port], opts).await.unwrap();
-        assert_eq!(report.hosts[0].ports[0].state, State::Closed);
+        assert_eq!(report.hosts[0].ports[0].state, State::Closed, "{report:#?}");
         assert_eq!(report.hosts[0].ports[0].attempts, 1);
     }
 
