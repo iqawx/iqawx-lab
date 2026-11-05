@@ -1,0 +1,77 @@
+name: Build and test IQAWX
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            name: macos-arm64
+          - os: macos-15-intel
+            name: macos-x64
+          - os: ubuntu-22.04
+            name: linux-x64
+          - os: windows-latest
+            name: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.93.1 --profile minimal --no-self-update
+      - name: Test engines and terminal CLI
+        run: cargo +1.93.1 test --locked
+      - name: Build short command and original command
+        run: cargo +1.93.1 build --release --locked --bins
+      - name: Prepare Unix package
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p package/scripts
+          cp target/release/iqaw target/release/iqawx_lab package/
+          cp scripts/install.sh package/scripts/
+          cp README.md README_AR.md 'Open IQAWX.command' package/
+          cp -R examples package/
+          tar -czf iqaw-${{ matrix.name }}.tar.gz -C package .
+          shasum -a 256 iqaw-${{ matrix.name }}.tar.gz > iqaw-${{ matrix.name }}.sha256
+      - name: Prepare Windows package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package/scripts | Out-Null
+          Copy-Item target/release/iqaw.exe,target/release/iqawx_lab.exe package/
+          Copy-Item scripts/install.ps1 package/scripts/
+          Copy-Item README.md,README_AR.md,'Open IQAWX.cmd' package/
+          Copy-Item -Recurse examples package/
+          Compress-Archive -Path package/* -DestinationPath iqaw-${{ matrix.name }}.zip
+          $hash = (Get-FileHash iqaw-${{ matrix.name }}.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  iqaw-${{ matrix.name }}.zip" | Set-Content iqaw-${{ matrix.name }}.sha256
+      - name: Verify Unix installer from package
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          sh package/scripts/install.sh --bin-dir "$RUNNER_TEMP/iqaw install" --no-path
+          "$RUNNER_TEMP/iqaw install/iqaw" --version
+          "$RUNNER_TEMP/iqaw install/iqaw" decode --format base64 --data SGVsbG8= --output-format text
+      - name: Verify Windows installer from package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ./package/scripts/install.ps1 -InstallDir "$env:RUNNER_TEMP/iqaw install" -NoPath
+          & "$env:RUNNER_TEMP/iqaw install/iqaw.exe" --version
+          & "$env:RUNNER_TEMP/iqaw install/iqaw.exe" decode --format base64 --data SGVsbG8= --output-format text
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iqaw-${{ matrix.name }}
+          path: |
+            iqaw-${{ matrix.name }}.tar.gz
+            iqaw-${{ matrix.name }}.zip
+            iqaw-${{ matrix.name }}.sha256
+          if-no-files-found: error

@@ -13,10 +13,10 @@ const MAX_INPUT: usize = 64 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "iqawx_lab",
+    name = "iqaw",
     version,
     about = "Rust network inspection, encoding analysis and keyed decryption",
-    after_help = "No arguments: interactive menu. Native scans are TCP connect/basic UDP, not a complete Nmap reimplementation. Use `nmap -- <args>` to invoke a separately installed Nmap."
+    after_help = "Run iqaw or iqaw menu for the terminal menu. Native scans are TCP connect/basic UDP, not a complete Nmap reimplementation. Use `nmap -- <args>` to invoke a separately installed Nmap."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -25,6 +25,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Open the original interactive terminal menu
+    Menu,
     /// Scan IPs, hostnames or CIDRs using the native Rust engine
     Scan(ScanArgs),
     /// Strictly decode an encoding; this is not cryptographic decryption
@@ -298,6 +300,7 @@ fn print_notice(message: &str) {
 
 async fn execute(command: Commands) -> Result<i32, String> {
     match command {
+        Commands::Menu => return Err("Use iqaw menu directly".into()),
         Commands::Scan(args) => {
             let protocol = match args.protocol {
                 ScanProtocol::Tcp => scanner::Protocol::Tcp,
@@ -469,7 +472,7 @@ fn prompt(label: &str) -> Result<Option<String>, String> {
 
 async fn interactive() -> Result<i32, String> {
     loop {
-        println!("\nIQAWX SECURITY LAB {}\n1) File analysis\n2) Hex analysis\n3) Text analysis\n4) Base64 decode\n5) Base32 decode\n6) URL decode\n7) Native network scan\n8) Exit\n9) Keyed decryption\n10) Explore encoding layers\nCLI help: iqawx_lab --help", env!("CARGO_PKG_VERSION"));
+        println!("\nIQAWX SECURITY LAB {}\n1) File analysis\n2) Hex analysis\n3) Text analysis\n4) Base64 decode\n5) Base32 decode\n6) URL decode\n7) Native network scan\n8) Exit\n9) Keyed decryption\n10) Explore encoding layers\nCLI help: iqaw --help", env!("CARGO_PKG_VERSION"));
         let Some(choice) = prompt("MODE > ")? else {
             return Ok(0);
         };
@@ -602,6 +605,7 @@ fn compatible_args() -> Vec<OsString> {
 async fn main() {
     let cli = Cli::parse_from(compatible_args());
     let result = match cli.command {
+        Some(Commands::Menu) => interactive().await,
         Some(command) => execute(command).await,
         None => interactive().await,
     };

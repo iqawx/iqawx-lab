@@ -6,3 +6,6 @@
 /.env.*
 /reports/
 *.log
+
+# Private local interface
+/local-ui/
