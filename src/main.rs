@@ -309,14 +309,15 @@ fn load_input(input: &InputArgs) -> Result<Vec<u8>, String> {
 fn protect_key_output(key: &Path, output: Option<&Path>) -> Result<(), String> {
     if let Some(out) = output {
         if let (Ok(key_path), Ok(out_path)) = (key.canonicalize(), out.canonicalize()) {
-            let mut same = key_path == out_path;
+            let same = key_path == out_path;
             #[cfg(unix)]
-            {
+            let same = {
                 use std::os::unix::fs::MetadataExt;
-                if let (Ok(k), Ok(o)) = (std::fs::metadata(key), std::fs::metadata(out)) {
-                    same |= k.dev() == o.dev() && k.ino() == o.ino();
+                match (std::fs::metadata(key), std::fs::metadata(out)) {
+                    (Ok(k), Ok(o)) => same || (k.dev() == o.dev() && k.ino() == o.ino()),
+                    _ => same,
                 }
-            }
+            };
             if same {
                 return Err("Output must not overwrite the key file".into());
             }
