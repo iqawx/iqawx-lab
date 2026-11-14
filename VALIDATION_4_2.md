@@ -1,4 +1,6 @@
-# IQAWX Lab 4.2.0 validation — 2026-11-14
+# IQAWX Lab 4.2.0 initial local validation — 2026-11-14
+
+This is the initial local-only record before merging the existing public launcher. Current Windows/Linux results and merged test counts are in [TEST_REPORT_EN.md](TEST_REPORT_EN.md) and [TEST_REPORT_AR.md](TEST_REPORT_AR.md).
 
 Environment: macOS Apple Silicon arm64; Rust/Cargo 1.93.1. This report describes the local 4.2.0 source and release binary, not a published release.
 
