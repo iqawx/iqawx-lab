@@ -11,7 +11,7 @@ Date: 14 November 2026 (Asia/Baghdad). Tested engine commit: `b9adbc9e606d9f51e2
 | Windows Server 2025 x64, GitHub `windows-latest` | Public engine, terminal CLI and installer | Passed: 68 tests; formatting, Clippy with warnings denied, release build, four encryption roundtrips, SHA-256 check and packaged installer |
 | Ubuntu 22.04 x64 | Public engine, terminal CLI and installer | Passed: 69 tests and the same quality/build/release/installer checks |
 | macOS 15 Apple Silicon | Public engine, terminal CLI and installer | Passed on GitHub Actions |
-| macOS 15 Intel | Public engine, terminal CLI and installer | Final job status is being verified |
+| macOS 15 Intel | Public engine, terminal CLI and installer | Passed on GitHub Actions |
 | Local macOS Apple Silicon | Public engine and both CLI names | Passed: 69 tests; Clippy; formatting; release builds |
 | Local macOS Apple Silicon | Private graphical interface | Passed: 10 tests; Clippy; release build; browser verification in Arabic and English |
 
