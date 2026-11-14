@@ -25,11 +25,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        run: rustup toolchain install 1.93.1 --profile minimal --no-self-update
-      - name: Test engines and terminal CLI
-        run: cargo +1.93.1 test --locked
-      - name: Build short command and original command
-        run: cargo +1.93.1 build --release --locked --bins
+        run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt --component clippy --no-self-update
+      - name: Validate source, engines and release on this OS
+        run: python scripts/ci_check.py
+      - name: Preserve test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ matrix.name }}
+          path: test-results/
+          if-no-files-found: warn
       - name: Prepare Unix package
         if: runner.os != 'Windows'
         shell: bash
@@ -37,7 +42,7 @@ jobs:
           mkdir -p package/scripts
           cp target/release/iqaw target/release/iqawx_lab package/
           cp scripts/install.sh package/scripts/
-          cp README.md README_AR.md 'Open IQAWX.command' package/
+          cp README.md README_AR.md GUIDE_4_2.md TEST_REPORT_AR.md TEST_REPORT_EN.md 'Open IQAWX.command' package/
           cp -R examples package/
           tar -czf iqaw-${{ matrix.name }}.tar.gz -C package .
           shasum -a 256 iqaw-${{ matrix.name }}.tar.gz > iqaw-${{ matrix.name }}.sha256
@@ -48,7 +53,7 @@ jobs:
           New-Item -ItemType Directory -Force package/scripts | Out-Null
           Copy-Item target/release/iqaw.exe,target/release/iqawx_lab.exe package/
           Copy-Item scripts/install.ps1 package/scripts/
-          Copy-Item README.md,README_AR.md,'Open IQAWX.cmd' package/
+          Copy-Item README.md,README_AR.md,GUIDE_4_2.md,TEST_REPORT_AR.md,TEST_REPORT_EN.md,'Open IQAWX.cmd' package/
           Copy-Item -Recurse examples package/
           Compress-Archive -Path package/* -DestinationPath iqaw-${{ matrix.name }}.zip
           $hash = (Get-FileHash iqaw-${{ matrix.name }}.zip -Algorithm SHA256).Hash.ToLower()

@@ -296,3 +296,192 @@ fn caesar_redirected_output_preserves_multiline_unicode() {
     assert!(out.status.success());
     assert_eq!(out.stdout, "B\nC\tعربي\n".as_bytes());
 }
+
+#[test]
+fn encrypted_files_roundtrip_and_failures_preserve_outputs_and_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("key.bin");
+    let encrypted = dir.path().join("sealed.json");
+    let out = dir.path().join("plain.bin");
+    let key_s = key.to_str().unwrap();
+    let enc_s = encrypted.to_str().unwrap();
+    let out_s = out.to_str().unwrap();
+    assert!(run(&["keygen", "--out", key_s]).status.success());
+    let original_key = fs::read(&key).unwrap();
+    assert_eq!(original_key.len(), 32);
+    assert!(!run(&["keygen", "--out", key_s]).status.success());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert!(run(&[
+        "encrypt",
+        "--data",
+        "عربي 🔐",
+        "--key-file",
+        key_s,
+        "--out",
+        enc_s
+    ])
+    .status
+    .success());
+    assert!(run(&[
+        "open",
+        "--input",
+        enc_s,
+        "--key-file",
+        key_s,
+        "--out",
+        out_s,
+        "--output-format",
+        "raw"
+    ])
+    .status
+    .success());
+    assert_eq!(fs::read(&out).unwrap(), "عربي 🔐".as_bytes());
+    assert!(!run(&[
+        "encrypt",
+        "--data",
+        "x",
+        "--key-file",
+        key_s,
+        "--out",
+        key_s,
+        "--force"
+    ])
+    .status
+    .success());
+    assert!(!run(&[
+        "open",
+        "--input",
+        enc_s,
+        "--key-file",
+        key_s,
+        "--out",
+        key_s,
+        "--force"
+    ])
+    .status
+    .success());
+    assert_eq!(fs::read(&key).unwrap(), original_key);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&encrypted).unwrap()).unwrap();
+    value["aad_base64"] = "dGFtcGVyZWQ=".into();
+    fs::write(&encrypted, serde_json::to_vec(&value).unwrap()).unwrap();
+    let failed = run(&[
+        "open",
+        "--input",
+        enc_s,
+        "--key-file",
+        key_s,
+        "--out",
+        out_s,
+        "--output-format",
+        "raw",
+        "--force",
+    ]);
+    assert_eq!(failed.status.code(), Some(2));
+    assert!(failed.stdout.is_empty());
+    assert_eq!(fs::read(&out).unwrap(), "عربي 🔐".as_bytes());
+}
+
+#[test]
+fn hashes_verify_and_human_analysis_preserves_json_default() {
+    let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    assert!(run(&["hash", "--data", "abc", "--expected", hash])
+        .status
+        .success());
+    let failed = run(&["hash", "--data", "abd", "--expected", hash]);
+    assert_eq!(failed.status.code(), Some(2));
+    assert!(failed.stdout.is_empty());
+    for command in ["analyze", "auto"] {
+        let result = run(&[command, "--data", "Njg2OQ=="]);
+        assert!(serde_json::from_slice::<serde_json::Value>(&result.stdout).is_ok());
+        let text = run(&[command, "--data", "Njg2OQ==", "--report-format", "text"]);
+        assert!(text.status.success());
+        assert!(String::from_utf8_lossy(&text.stdout).contains("IQAWX"));
+    }
+}
+
+#[test]
+fn target_files_exclusions_and_export_formats_work_on_loopback() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let targets = dir.path().join("targets.txt");
+    fs::write(
+        &targets,
+        "# local fixtures\n127.0.0.1\n127.0.0.2 # excluded\n",
+    )
+    .unwrap();
+    for format in ["json", "csv", "html", "xml"] {
+        let result = run(&[
+            "scan",
+            "--targets-file",
+            targets.to_str().unwrap(),
+            "--exclude",
+            "127.0.0.2/32",
+            "-p",
+            &port,
+            "--format",
+            format,
+            "--progress",
+        ]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("Progress:"));
+        assert!(!String::from_utf8_lossy(&result.stdout).contains("Progress:"));
+        let text = String::from_utf8_lossy(&result.stdout);
+        match format {
+            "json" => {
+                let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+                assert_eq!(report["total_jobs"], 1);
+                assert_eq!(report["completed_jobs"], 1);
+                assert_eq!(report["complete"], true);
+                assert_eq!(report["summary"]["open"], 1);
+            }
+            "csv" => assert!(text.starts_with("record,complete,")),
+            "html" => assert!(text.starts_with("<!doctype html>")),
+            "xml" => {
+                assert!(text.contains("<completion complete=\"true\" total=\"1\" completed=\"1\""))
+            }
+            _ => unreachable!(),
+        }
+    }
+    let result = run(&["scan", "127.0.0.1", "--exclude", "127.0.0.0/8", "-p", &port]);
+    assert_eq!(result.status.code(), Some(2));
+}
+
+#[test]
+fn deadline_returns_partial_json_and_interrupted_status() {
+    // Keep a UDP port open but silent, guaranteeing a pending probe at the deadline.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port().to_string();
+    let result = run(&[
+        "scan",
+        "127.0.0.1",
+        "-p",
+        &port,
+        "--protocol",
+        "udp",
+        "--timeout-ms",
+        "5000",
+        "--deadline-secs",
+        "1",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(result.status.code(), Some(130));
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["complete"], false);
+    assert_eq!(report["total_jobs"], 1);
+    assert_eq!(report["completed_jobs"], 0);
+    assert_eq!(report["hosts"][0]["ports"].as_array().unwrap().len(), 0);
+}

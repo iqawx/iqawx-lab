@@ -1,4 +1,4 @@
-# IQAWX Lab 4.1
+# IQAWX Lab 4.2
 
 A terminal toolkit for network inspection, encoding analysis, and decryption with known keys. Install once, then use **`iqaw`** from any terminal. The public distribution runs entirely in the terminal.
 
@@ -127,3 +127,8 @@ cargo test --locked
 On Windows, the built executable is `.\target\release\iqaw.exe`. The original `iqawx_lab` executable is also built and included in packages for compatibility. `cargo run --release --locked` defaults to the `iqaw` terminal command.
 
 See [original validation](VALIDATION.md) and [publication checks](PUBLICATION_CHECKS.md) for dated results and platform limitations. Example keys and the RSA key in unit tests are disposable public test fixtures. Never use them for real data.
+
+
+## 4.2 updates / تحديثات 4.2
+
+[Feature guide / دليل الميزات](GUIDE_4_2.md) · [English test report](TEST_REPORT_EN.md) · [تقرير الاختبار بالعربي](TEST_REPORT_AR.md)

@@ -1,4 +1,3 @@
-
 use ipnet::IpNet;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -74,10 +73,15 @@ pub struct ScanOptions {
     pub service_detection: bool,
     pub protocol: Protocol,
     pub max_hosts: usize,
+    pub exclude: Vec<IpNet>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ScanReport {
+    /// False means unfinished ports are absent, never implicitly closed.
+    pub complete: bool,
+    pub total_jobs: usize,
+    pub completed_jobs: usize,
     pub protocol: Protocol,
     pub scan_type: String,
     pub timeout_ms: u64,
@@ -109,7 +113,7 @@ pub struct PortResult {
 #[derive(Debug, Serialize)]
 pub struct ServiceInfo {
     pub name: String,
-    
+
     pub method: String,
     pub evidence: Option<String>,
 }
@@ -142,7 +146,6 @@ impl ServiceDatabase {
         Self::parse(text)
     }
 
-  
     pub fn parse(text: &str) -> Result<Self, String> {
         if text.len() > MAX_SERVICES_FILE {
             return Err("Services file exceeds the 16 MiB size limit".into());
@@ -457,6 +460,27 @@ pub async fn scan(
     ports: &[u16],
     options: ScanOptions,
 ) -> Result<ScanReport, String> {
+    scan_controlled(targets, ports, options, std::future::pending(), |_| {}).await
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ScanProgress {
+    pub completed: usize,
+    pub total: usize,
+    pub open: usize,
+    pub elapsed_ms: u64,
+}
+
+/// Cancellation returns completed results after stopping and joining workers.
+/// Cancellation during name resolution returns an error (no inventory exists yet).
+pub async fn scan_controlled(
+    targets: &[String],
+    ports: &[u16],
+    options: ScanOptions,
+    cancel: impl std::future::Future<Output = ()>,
+    mut progress: impl FnMut(ScanProgress),
+) -> Result<ScanReport, String> {
+    tokio::pin!(cancel);
     let started = Instant::now();
     validate(&options)?;
     if ports.is_empty() || ports.contains(&0) {
@@ -468,7 +492,15 @@ pub async fn scan(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let addresses = resolve_targets(targets, &options).await?;
+    let mut addresses = tokio::select! {
+        biased;
+        _ = &mut cancel => return Err("Scan stopped during target resolution; no report available".into()),
+        result = resolve_targets(targets, &options) => result?,
+    };
+    addresses.retain(|ip, _| !options.exclude.iter().any(|net| net.contains(ip)));
+    if addresses.is_empty() {
+        return Err("No targets remain after exclusions".into());
+    }
     if addresses
         .len()
         .checked_mul(ports.len())
@@ -496,6 +528,16 @@ pub async fn scan(
         .iter()
         .enumerate()
         .flat_map(|(index, ip)| ports.iter().map(move |port| (index, *ip, *port)));
+    let total_jobs = addresses.len() * ports.len();
+    let mut completed_jobs = 0;
+    let mut open = 0;
+    let mut complete = true;
+    progress(ScanProgress {
+        completed: 0,
+        total: total_jobs,
+        open,
+        elapsed_ms: elapsed_ms(started),
+    });
     let options = Arc::new(options);
     let limiter = Arc::new(RateLimiter::new(options.rate));
     let mut active = JoinSet::new();
@@ -510,12 +552,49 @@ pub async fn scan(
                 break;
             }
         }
-        match active.join_next().await {
-            Some(Ok((index, result))) => hosts[index].ports.push(result),
+        if active.is_empty() {
+            break;
+        }
+        let joined = tokio::select! {
+            biased;
+            _ = &mut cancel => {
+                complete = false;
+                active.abort_all();
+                // Keep results already completed when cancellation arrived.
+                while let Some(result) = active.join_next().await {
+                    if let Ok((index, port)) = result {
+                        open += usize::from(port.state == State::Open);
+                        hosts[index].ports.push(port);
+                        completed_jobs += 1;
+                    }
+                }
+                break;
+            },
+            result = active.join_next() => result,
+        };
+        match joined {
+            Some(Ok((index, result))) => {
+                open += usize::from(result.state == State::Open);
+                hosts[index].ports.push(result);
+                completed_jobs += 1;
+                progress(ScanProgress {
+                    completed: completed_jobs,
+                    total: total_jobs,
+                    open,
+                    elapsed_ms: elapsed_ms(started),
+                });
+            }
             Some(Err(error)) => return Err(format!("Scan worker failed: {error}")),
             None => break,
         }
     }
+    complete |= completed_jobs == total_jobs;
+    progress(ScanProgress {
+        completed: completed_jobs,
+        total: total_jobs,
+        open,
+        elapsed_ms: elapsed_ms(started),
+    });
     for host in &mut hosts {
         host.ports.sort_by_key(|result| result.port);
     }
@@ -526,7 +605,13 @@ pub async fn scan(
     if options.rate.is_some() {
         warnings.push("The rate limit controls probe/connection starts. The operating system controls TCP retransmissions.".into());
     }
+    if !complete {
+        warnings.push("Partial scan: stopped by user or deadline. Missing ports were not completed; their state is unknown.".into());
+    }
     Ok(ScanReport {
+        complete,
+        total_jobs,
+        completed_jobs,
         protocol: options.protocol,
         scan_type: match options.protocol {
             Protocol::Tcp => "tcp-connect",
@@ -834,6 +919,7 @@ mod tests {
 
     fn options(protocol: Protocol) -> ScanOptions {
         ScanOptions {
+            exclude: vec![],
             timeout_ms: 150,
             concurrency: 4,
             retries: 0,
@@ -851,6 +937,61 @@ mod tests {
             .remove(0)
             .ports
             .remove(0)
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_completed_results_and_stops_pending_workers() {
+        let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (first, second) = if a.local_addr().unwrap().port() < b.local_addr().unwrap().port() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let ports = [
+            first.local_addr().unwrap().port(),
+            second.local_addr().unwrap().port(),
+        ];
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = first.accept().await.unwrap();
+            stream.write_all(b"SSH-2.0-Fixture\r\n").await.unwrap();
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut tx = Some(tx);
+        let mut opts = options(Protocol::Tcp);
+        opts.concurrency = 1;
+        opts.service_detection = true;
+        let mut snapshots = vec![];
+        let report = scan_controlled(
+            &["127.0.0.1".into()],
+            &ports,
+            opts,
+            async {
+                rx.await.unwrap();
+            },
+            |p| {
+                snapshots.push(p);
+                if p.completed == 1 {
+                    if let Some(tx) = tx.take() {
+                        tx.send(()).unwrap();
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(!report.complete);
+        assert_eq!(report.total_jobs, 2);
+        assert_eq!(report.completed_jobs, 1);
+        assert_eq!(report.hosts[0].ports.len(), 1);
+        assert_eq!(report.hosts[0].ports[0].port, ports[0]);
+        assert_eq!(report.hosts[0].ports[0].state, State::Open);
+        assert_eq!(snapshots.first().unwrap().completed, 0);
+        assert_eq!(snapshots.last().unwrap().completed, 1);
+        assert!(snapshots
+            .windows(2)
+            .all(|p| p[0].completed <= p[1].completed));
     }
 
     #[test]
@@ -995,6 +1136,9 @@ mod tests {
             evidence: Some("SSH protocol identification line".into()),
         };
         let mut report = ScanReport {
+            complete: true,
+            total_jobs: 6,
+            completed_jobs: 6,
             protocol: Protocol::Tcp,
             scan_type: "test".into(),
             timeout_ms: 100,
@@ -1155,7 +1299,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let mut opts = options(Protocol::Tcp);
-        // Give Windows time to report refusal instead of testing the 150 ms deadline.
+        // Windows can take longer to return loopback refusal.
         opts.timeout_ms = 5000;
         opts.retries = 2;
         let report = scan(&["127.0.0.1".into()], &[port], opts).await.unwrap();

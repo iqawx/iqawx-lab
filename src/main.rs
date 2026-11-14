@@ -1,6 +1,6 @@
 use base64::Engine;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use iqawx_lab::{analysis, crypto, scanner};
+use iqawx_lab::{analysis, crypto, scanner, sealed};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
@@ -15,7 +15,7 @@ const MAX_INPUT: usize = 64 * 1024 * 1024;
 #[command(
     name = "iqaw",
     version,
-    about = "Rust network inspection, encoding analysis and keyed decryption",
+    about = "Network inspection, authenticated encryption, hashing and data analysis",
     after_help = "Run iqaw or iqaw menu for the terminal menu. Native scans are TCP connect/basic UDP, not a complete Nmap reimplementation. Use `nmap -- <args>` to invoke a separately installed Nmap."
 )]
 struct Cli {
@@ -25,10 +25,51 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Open the original interactive terminal menu
+    /// Open the terminal menu
     Menu,
     /// Scan IPs, hostnames or CIDRs using the native Rust engine
     Scan(ScanArgs),
+    /// Generate a random symmetric key in a new private file
+    Keygen {
+        #[arg(long, default_value = "256", value_parser = ["128", "192", "256"])]
+        bits: String,
+        #[arg(short, long)]
+        out: PathBuf,
+    },
+    /// Encrypt into a versioned JSON envelope with a fresh random nonce
+    Encrypt {
+        #[arg(long, default_value = "xchacha20-poly1305", value_parser = ["aes128-gcm", "aes256-gcm", "chacha20-poly1305", "xchacha20-poly1305"])]
+        algorithm: String,
+        #[command(flatten)]
+        input: InputArgs,
+        #[command(flatten)]
+        key: KeyArgs,
+        /// Authenticated context as hex (maximum 64 KiB); stored in the envelope
+        #[arg(long)]
+        aad: Option<String>,
+        #[arg(short, long)]
+        out: PathBuf,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Authenticate and decrypt an IQAWX JSON envelope
+    Open {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[command(flatten)]
+        key: KeyArgs,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Compute SHA-256/384/512 and optionally verify an expected hex digest
+    Hash {
+        #[command(flatten)]
+        input: InputArgs,
+        #[arg(long, default_value = "sha256", value_parser = ["sha256", "sha384", "sha512"])]
+        algorithm: String,
+        #[arg(long)]
+        expected: Option<String>,
+    },
     /// Strictly decode an encoding; this is not cryptographic decryption
     Decode {
         #[command(flatten)]
@@ -60,6 +101,8 @@ enum Commands {
     Analyze {
         #[command(flatten)]
         input: InputArgs,
+        #[arg(long, value_enum, default_value_t = AnalysisFormat::Json)]
+        report_format: AnalysisFormat,
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u8).range(1..=20))]
         top: u8,
         #[arg(long)]
@@ -71,6 +114,8 @@ enum Commands {
     Auto {
         #[command(flatten)]
         input: InputArgs,
+        #[arg(long, value_enum, default_value_t = AnalysisFormat::Json)]
+        report_format: AnalysisFormat,
         #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=5))]
         depth: u8,
         #[arg(long)]
@@ -102,8 +147,23 @@ enum Commands {
 
 #[derive(Args, Debug)]
 struct ScanArgs {
-    #[arg(required = true)]
+    #[arg(required_unless_present = "targets_file")]
     targets: Vec<String>,
+    /// UTF-8 target list: one IP, hostname or CIDR per line; # comments allowed
+    #[arg(long)]
+    targets_file: Option<PathBuf>,
+    /// Exclude IPs or CIDRs after resolution (comma-separated or repeated)
+    #[arg(long, value_delimiter = ',')]
+    exclude: Vec<String>,
+    /// Show progress on stderr, including when output is redirected
+    #[arg(long, conflicts_with = "quiet")]
+    progress: bool,
+    /// Disable automatic terminal progress
+    #[arg(long)]
+    quiet: bool,
+    /// Stop after this duration and save completed results (exit status 130)
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86400))]
+    deadline_secs: Option<u64>,
     #[arg(short = 'p', long, default_value = "", allow_hyphen_values = true)]
     ports: String,
     /// Read port-name hints and frequencies from an nmap-services format file
@@ -151,6 +211,29 @@ enum ReportFormat {
     Json,
     Xml,
     Grep,
+    Csv,
+    Html,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AnalysisFormat {
+    Json,
+    Text,
+}
+
+#[derive(Args, Debug)]
+struct KeyArgs {
+    #[arg(long)]
+    key_file: PathBuf,
+    #[arg(long, default_value = "raw", value_parser = ["raw", "hex", "base64"])]
+    key_format: String,
+}
+
+impl KeyArgs {
+    fn load(&self) -> Result<Zeroizing<Vec<u8>>, String> {
+        let bytes = Zeroizing::new(read_file(&self.key_file, 65536)?);
+        Ok(Zeroizing::new(crypto::decode(&self.key_format, &bytes)?))
+    }
 }
 
 #[derive(Args, Debug)]
@@ -221,6 +304,25 @@ fn load_input(input: &InputArgs) -> Result<Vec<u8>, String> {
         _ => return Err("Provide exactly one of --data or --input (maximum 64 MiB)".into()),
     };
     crypto::decode(&input.format, &bytes)
+}
+
+fn protect_key_output(key: &Path, output: Option<&Path>) -> Result<(), String> {
+    if let Some(out) = output {
+        if let (Ok(key_path), Ok(out_path)) = (key.canonicalize(), out.canonicalize()) {
+            let mut same = key_path == out_path;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if let (Ok(k), Ok(o)) = (std::fs::metadata(key), std::fs::metadata(out)) {
+                    same |= k.dev() == o.dev() && k.ino() == o.ino();
+                }
+            }
+            if same {
+                return Err("Output must not overwrite the key file".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn write_output(data: &[u8], path: Option<&Path>, force: bool) -> Result<(), String> {
@@ -301,6 +403,54 @@ fn print_notice(message: &str) {
 async fn execute(command: Commands) -> Result<i32, String> {
     match command {
         Commands::Menu => return Err("Use iqaw menu directly".into()),
+        Commands::Keygen { bits, out } => {
+            let length = bits.parse::<usize>().map_err(|e| e.to_string())? / 8;
+            let key = Zeroizing::new(sealed::random_bytes(length)?);
+            write_output(&key, Some(&out), false)?;
+            print_notice(&format!("Created {bits}-bit key: {}", out.display()));
+        }
+        Commands::Encrypt {
+            algorithm,
+            input,
+            key,
+            aad,
+            out,
+            force,
+        } => {
+            protect_key_output(&key.key_file, Some(&out))?;
+            let plain = Zeroizing::new(load_input(&input)?);
+            let key = key.load()?;
+            let aad = crypto::decode("hex", aad.as_deref().unwrap_or("").as_bytes())?;
+            let envelope = sealed::seal(&algorithm, &plain, &key, &aad)?;
+            emit_json(&envelope, Some(&out), force)?;
+        }
+        Commands::Open { input, key, output } => {
+            protect_key_output(&key.key_file, output.out.as_deref())?;
+            let bytes = if input == Path::new("-") {
+                read_limited(io::stdin().lock(), MAX_INPUT * 2)?
+            } else {
+                read_file(&input, MAX_INPUT * 2)?
+            };
+            let envelope: sealed::Envelope = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("Invalid IQAWX envelope: {e}"))?;
+            let key = key.load()?;
+            let plaintext = Zeroizing::new(sealed::open(&envelope, &key)?);
+            emit_bytes(&plaintext, &output)?;
+        }
+        Commands::Hash {
+            input,
+            algorithm,
+            expected,
+        } => {
+            let digest = sealed::digest(&algorithm, &load_input(&input)?)?;
+            if let Some(expected) = expected {
+                if crypto::decode("hex", expected.as_bytes())? != digest {
+                    return Err("Digest mismatch".into());
+                }
+                print_notice("Digest verified");
+            }
+            write_output(format!("{}\n", hex::encode(digest)).as_bytes(), None, false)?;
+        }
         Commands::Scan(args) => {
             let protocol = match args.protocol {
                 ScanProtocol::Tcp => scanner::Protocol::Tcp,
@@ -315,7 +465,18 @@ async fn execute(command: Commands) -> Result<i32, String> {
                 (Some(count), Some(database)) => database.top_ports(protocol, count as usize)?,
                 _ => scanner::parse_ports(&args.ports)?,
             };
+            let exclude = args
+                .exclude
+                .iter()
+                .map(|value| {
+                    value
+                        .parse::<ipnet::IpNet>()
+                        .or_else(|_| value.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                        .map_err(|_| format!("Invalid excluded IP/CIDR: {value}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let options = scanner::ScanOptions {
+                exclude,
                 timeout_ms: args.timeout_ms,
                 concurrency: args.concurrency as usize,
                 retries: args.retries,
@@ -324,13 +485,60 @@ async fn execute(command: Commands) -> Result<i32, String> {
                 protocol,
                 max_hosts: args.max_hosts as usize,
             };
-            let mut scan = tokio::select! {
-                result = scanner::scan(&args.targets, &ports, options) => result?,
-                signal = tokio::signal::ctrl_c() => {
-                    signal.map_err(|e| e.to_string())?;
-                    return Err("Scan cancelled; no complete report was written".into());
+            // Validate target-list size before making network connections.
+            let mut targets = args.targets;
+            if let Some(path) = args.targets_file {
+                let bytes = read_file(&path, 1024 * 1024)?;
+                let text = std::str::from_utf8(&bytes)
+                    .map_err(|_| "Target list must be UTF-8".to_string())?;
+                for line in text.lines() {
+                    let target = line.split('#').next().unwrap_or("").trim();
+                    if !target.is_empty() {
+                        if target.split_whitespace().count() != 1 {
+                            return Err("Use one target per line".into());
+                        }
+                        targets.push(target.to_owned());
+                    }
+                }
+            }
+            if targets.is_empty() || targets.len() > 65536 {
+                return Err("Provide 1–65536 target entries".into());
+            }
+            let show_progress = args.progress || (io::stderr().is_terminal() && !args.quiet);
+            let mut last_update = std::time::Instant::now();
+            let cancel = async {
+                let deadline = async {
+                    match args.deadline_secs {
+                        Some(seconds) => {
+                            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::select! {
+                    signal = tokio::signal::ctrl_c() => {
+                        if let Err(error) = signal { print_notice(&format!("Cannot listen for Ctrl-C: {error}")); }
+                    },
+                    _ = deadline => {},
                 }
             };
+            let mut scan = scanner::scan_controlled(&targets, &ports, options, cancel, |p| {
+                if show_progress
+                    && (p.completed == 0
+                        || p.completed == p.total
+                        || last_update.elapsed().as_millis() >= 250)
+                {
+                    eprintln!(
+                        "Progress: {}/{} completed | {} open | {:.1}s",
+                        p.completed,
+                        p.total,
+                        p.open,
+                        p.elapsed_ms as f64 / 1000.0
+                    );
+                    last_update = std::time::Instant::now();
+                }
+            })
+            .await?;
             if let Some(database) = database {
                 database.apply_hints(&mut scan);
                 scan.warnings.push(format!(
@@ -345,7 +553,19 @@ async fn execute(command: Commands) -> Result<i32, String> {
                 .any(|p| matches!(p.state, scanner::State::Error));
             let rendered = report::render(&scan, args.format, args.open)?;
             write_output(rendered.as_bytes(), args.out.as_deref(), args.force)?;
-            return Ok(if has_errors { 2 } else { 0 });
+            if !scan.complete {
+                print_notice(&format!(
+                    "Partial results saved: {}/{} jobs completed",
+                    scan.completed_jobs, scan.total_jobs
+                ));
+            }
+            return Ok(if !scan.complete {
+                130
+            } else if has_errors {
+                2
+            } else {
+                0
+            });
         }
         Commands::Decode { input, output } => emit_bytes(&load_input(&input)?, &output)?,
         Commands::Decrypt {
@@ -382,26 +602,38 @@ async fn execute(command: Commands) -> Result<i32, String> {
             top,
             out,
             force,
-        } => emit_json(
-            &analysis::analyze(&load_input(&input)?, top as usize),
-            out.as_deref(),
-            force,
-        )?,
+            report_format,
+        } => {
+            let result = analysis::analyze(&load_input(&input)?, top as usize);
+            match report_format {
+                AnalysisFormat::Json => emit_json(&result, out.as_deref(), force)?,
+                AnalysisFormat::Text => write_output(
+                    report::analysis_text(&result).as_bytes(),
+                    out.as_deref(),
+                    force,
+                )?,
+            }
+        }
         Commands::Auto {
             input,
             depth,
             out,
             force,
+            report_format,
         } => {
             let data = load_input(&input)?;
             if data.len() > analysis::MAX_LAYER_INPUT_BYTES {
                 return Err("Layer exploration supports at most 1 MiB of decoded input".into());
             }
-            emit_json(
-                &analysis::decode_layers(&data, depth as usize),
-                out.as_deref(),
-                force,
-            )?;
+            let result = analysis::decode_layers(&data, depth as usize);
+            match report_format {
+                AnalysisFormat::Json => emit_json(&result, out.as_deref(), force)?,
+                AnalysisFormat::Text => write_output(
+                    report::layers_text(&result).as_bytes(),
+                    out.as_deref(),
+                    force,
+                )?,
+            }
         }
         Commands::Xor {
             hex_bytes,
@@ -472,7 +704,7 @@ fn prompt(label: &str) -> Result<Option<String>, String> {
 
 async fn interactive() -> Result<i32, String> {
     loop {
-        println!("\nIQAWX SECURITY LAB {}\n1) File analysis\n2) Hex analysis\n3) Text analysis\n4) Base64 decode\n5) Base32 decode\n6) URL decode\n7) Native network scan\n8) Exit\n9) Keyed decryption\n10) Explore encoding layers\nCLI help: iqaw --help", env!("CARGO_PKG_VERSION"));
+        println!("\nIQAWX SECURITY LAB {}\n1) File analysis\n2) Hex analysis\n3) Text analysis\n4) Base64 decode\n5) Base32 decode\n6) URL decode\n7) Native network scan\n8) Exit\n9) Keyed decryption\n10) Explore encoding layers\n11) Generate encryption key\n12) Encrypt file\n13) Open encrypted file\n14) Hash file\nCLI help: iqaw --help", env!("CARGO_PKG_VERSION"));
         let Some(choice) = prompt("MODE > ")? else {
             return Ok(0);
         };
@@ -483,7 +715,13 @@ async fn interactive() -> Result<i32, String> {
                 let Some(path) = prompt("File path: ")? else {
                     return Ok(0);
                 };
-                args.extend(["analyze".into(), "--input".into(), path]);
+                args.extend([
+                    "analyze".into(),
+                    "--input".into(),
+                    path,
+                    "--report-format".into(),
+                    "text".into(),
+                ]);
             }
             "2" | "3" | "4" | "5" | "6" | "10" => {
                 let Some(data) = prompt("Data: ")? else {
@@ -497,6 +735,9 @@ async fn interactive() -> Result<i32, String> {
                     "6" => ("decode", "url"),
                     _ => ("auto", "raw"),
                 };
+                if matches!(command, "analyze" | "auto") {
+                    args.extend(["--report-format".into(), "text".into()]);
+                }
                 args.extend([
                     command.into(),
                     "--data".into(),
@@ -554,8 +795,48 @@ async fn interactive() -> Result<i32, String> {
                     args.extend(["--out".into(), out, "--output-format".into(), "raw".into()]);
                 }
             }
+            "11" => {
+                let Some(out) = prompt("New key file (256-bit): ")? else {
+                    return Ok(0);
+                };
+                args.extend(["keygen".into(), "--out".into(), out]);
+            }
+            "12" | "13" => {
+                let Some(input) = prompt("Input file: ")? else {
+                    return Ok(0);
+                };
+                let Some(key) = prompt("Key file (raw bytes): ")? else {
+                    return Ok(0);
+                };
+                let Some(out) = prompt("New output file: ")? else {
+                    return Ok(0);
+                };
+                let command = if choice.trim() == "12" {
+                    "encrypt"
+                } else {
+                    "open"
+                };
+                args.extend([
+                    command.into(),
+                    "--input".into(),
+                    input,
+                    "--key-file".into(),
+                    key,
+                    "--out".into(),
+                    out,
+                ]);
+                if command == "open" {
+                    args.extend(["--output-format".into(), "raw".into()]);
+                }
+            }
+            "14" => {
+                let Some(input) = prompt("File to hash (SHA-256): ")? else {
+                    return Ok(0);
+                };
+                args.extend(["hash".into(), "--input".into(), input]);
+            }
             _ => {
-                eprintln!("Choose 1–10.");
+                eprintln!("Choose 1–14.");
                 continue;
             }
         }
